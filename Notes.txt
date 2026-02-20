@@ -1,0 +1,1473 @@
+Below is a product spec + file format spec + API docs for what we’ve described: an OBJ-like 3D layer where beliefs are vertices, triangles encode local coherence, and stretch/strain dampens confidence—packaged as a single human-readable file that opens into a Postman-like browser UI for agents.
+
+I’m going to name the ecosystem for clarity:
+	•	File type: .sem (Semantics Mesh)
+	•	Desktop/UI app: Semantics Studio
+	•	Local runtime/API: Semantics Runtime
+
+You can rename later without changing the design.
+
+⸻
+
+Semantics Mesh v0.1 Product Spec
+
+Product promise
+
+A .sem file is a portable semantic workspace:
+	•	Human-readable: open in any text editor
+	•	Machine/agent-readable: structured records + stable IDs
+	•	Visually inspectable: double-click opens a browser UI showing a 3D mesh
+	•	Agent-agnostic: any agent can read/write via a simple local API
+	•	Coherence-aware: “belief confidence” is dampened by geometric strain in triangles
+
+Mental model
+	•	A belief is a vertex in 3D space.
+	•	A triangle ties three beliefs together as a minimal “closed” coherence unit.
+	•	When beliefs move, triangles stretch.
+	•	Stretch produces strain.
+	•	Strain reduces effective confidence (and can optionally trigger “suggested repairs”).
+
+This is a semantic interface and coherence simulator, not a “cognitive simulation.”
+
+⸻
+
+File Format Spec: .sem (OBJ-compatible + JSON records)
+
+Design goals
+	1.	Keep the OBJ 3D layer: vertices and faces are first-class.
+	2.	Allow multiple “types” in one file (beliefs, triangles, metadata, events, requests).
+	3.	Remain diff-friendly for Git.
+	4.	Be safely parseable by a runtime without executing code.
+
+High-level structure
+
+A .sem file is:
+	•	A valid Wavefront OBJ geometry stream: v (vertices), f (faces).
+	•	Plus structured JSON records embedded as comments using a reserved prefix: #@ 
+
+Why comments?
+	•	OBJ tooling ignores comments, but still loads the geometry.
+	•	Semantics Runtime reads comments as one JSON object per line (JSONL-style).
+
+Reserved comment prefix
+	•	#@  means “Semantics record (JSON object follows)”
+	•	Other comments # ... are freeform and ignored by the runtime.
+
+⸻
+
+Canonical mapping rules
+
+OBJ vertices and faces are positional lists; semantics need stable IDs.
+
+Vertex ↔ belief mapping
+
+Each belief record binds to a vertex index:
+	•	OBJ vertex indices are 1-based (standard OBJ).
+	•	A belief record must include "vertex": <int>.
+
+Face ↔ triangle mapping
+
+Each triangle record binds to a face index, or explicitly lists vertex indices:
+	•	"face": <int> (1-based in the file’s face order), or
+	•	"vertices": [v1, v2, v3]
+
+⸻
+
+Required header record
+
+The file must include a format header near the top:
+
+#@ {"type":"header","sem_version":"0.1","space":"R3","units":"arb","created_at":"2026-02-20T00:00:00Z"}
+
+	•	space is "R3" for this v0.1 spec (your “must keep 3 dimensions” constraint).
+
+⸻
+
+Core record types
+
+1) Belief record (type: "belief")
+
+Represents the semantic payload attached to a vertex.
+
+Schema (v0.1):
+
+{
+  "type": "belief",
+  "id": "b_...",                 // stable string ID (UUID, hash, etc.)
+  "vertex": 1,                   // 1-based OBJ vertex index
+  "proposition": "…",            // human-readable belief statement
+  "confidence_base": 0.0,        // 0..1, prior confidence before strain
+  "tags": ["optional", "tags"],
+  "provenance": {
+    "source": "human|agent|tool",
+    "author": "optional",
+    "refs": ["optional external refs"]
+  },
+  "embedding": {
+    "model": "optional",
+    "dims": 1536,
+    "codec": "float32|base64",
+    "data": "optional in-file or omitted"
+  },
+  "updated_at": "ISO-8601"
+}
+
+Notes:
+	•	Position is not stored in JSON; it comes from the OBJ v x y z line at that vertex index.
+	•	Embedding payload is optional. For v0, you can omit it entirely and still have a working system.
+
+2) Triangle record (type: "triangle")
+
+Defines a coherence simplex between 3 beliefs.
+
+Schema (v0.1):
+
+{
+  "type": "triangle",
+  "id": "t_...",
+  "face": 1,                     // or omit and use "vertices":[]
+  "vertices": [1,2,3],            // optional explicit mapping
+  "rest": {
+    "edge_lengths": [1.0, 1.0, 1.0] // L12, L23, L31 (rest/ideal lengths)
+  },
+  "physics": {
+    "stiffness": 1.0,             // spring strength
+    "damping": 0.2                // local damping
+  },
+  "semantics": {
+    "relation": "coherence",
+    "notes": "optional"
+  },
+  "updated_at": "ISO-8601"
+}
+
+Notes:
+	•	A triangle corresponds to an OBJ face f i j k.
+	•	Rest lengths can be:
+	•	explicit, or
+	•	computed at creation time from current geometry (then persisted).
+
+3) Edge record (type: "edge") — optional in v0.1
+
+For pairwise constraints, useful when triangles aren’t present.
+
+{
+  "type":"edge",
+  "id":"e_...",
+  "vertices":[1,2],
+  "rest":{"length":1.0},
+  "physics":{"stiffness":0.5,"damping":0.2},
+  "updated_at":"ISO-8601"
+}
+
+4) Event record (type: "event") — for append-only edits
+
+Events are how agents (or UI) mutate state while keeping Git diffs sane.
+
+{
+  "type":"event",
+  "id":"ev_...",
+  "ts":"ISO-8601",
+  "actor":{"type":"human|agent","name":"…"},
+  "op":"move_vertex|set_confidence|set_proposition|add_triangle|remove_triangle",
+  "args": { }
+}
+
+Recommended: events are append-only; the runtime can “materialize” a snapshot on save.
+
+5) Request record (type: "request") — the “Postman for agents” piece
+
+This is how .sem becomes an executable, agent-facing workspace.
+
+{
+  "type":"request",
+  "id":"r_...",
+  "name":"Summarize local neighborhood",
+  "input": {
+    "select": {
+      "mode":"neighborhood",
+      "center_belief_id":"b_...",
+      "radius": 2,
+      "max_items": 50
+    }
+  },
+  "agent": {
+    "interface":"generic",
+    "instruction":"Generate a concise summary of these beliefs and tensions.",
+    "output_format":"patch_v0"
+  },
+  "apply": {
+    "mode":"suggest",             // "suggest" | "auto" (auto requires policy)
+    "target":"workspace"
+  }
+}
+
+
+⸻
+
+Geometry lines (OBJ layer)
+
+Vertices:
+
+v 0.000 0.000 0.000
+v 1.000 0.000 0.000
+v 0.000 1.000 0.000
+
+Faces (triangles):
+
+f 1 2 3
+
+
+⸻
+
+Minimal complete example .sem
+
+#@ {"type":"header","sem_version":"0.1","space":"R3","units":"arb","created_at":"2026-02-20T00:00:00Z"}
+
+v 0 0 0
+#@ {"type":"belief","id":"b1","vertex":1,"proposition":"Belief A","confidence_base":0.9,"updated_at":"2026-02-20T00:00:00Z"}
+
+v 1 0 0
+#@ {"type":"belief","id":"b2","vertex":2,"proposition":"Belief B","confidence_base":0.8,"updated_at":"2026-02-20T00:00:00Z"}
+
+v 0 1 0
+#@ {"type":"belief","id":"b3","vertex":3,"proposition":"Belief C","confidence_base":0.7,"updated_at":"2026-02-20T00:00:00Z"}
+
+f 1 2 3
+#@ {"type":"triangle","id":"t1","face":1,"rest":{"edge_lengths":[1,1,1.41421356]},"physics":{"stiffness":1.0,"damping":0.25},"updated_at":"2026-02-20T00:00:00Z"}
+
+#@ {"type":"request","id":"r1","name":"Summarize triangle tensions","input":{"select":{"mode":"triangle","triangle_id":"t1"}},"agent":{"interface":"generic","instruction":"Explain tensions and propose edits.","output_format":"patch_v0"},"apply":{"mode":"suggest","target":"workspace"}}
+
+
+⸻
+
+Coherence Engine Spec: “Semantic Physics” v0.1
+
+This is intentionally small: it’s not rigid-body physics; it’s a local relaxation system.
+
+State
+	•	Vertex positions p_i ∈ R³ come from OBJ v lines.
+	•	Triangles define constraints via rest edge lengths.
+
+Strain / energy for a triangle
+
+For triangle with vertices (a,b,c), define edge lengths:
+	•	d_ab = ||p_a - p_b||
+	•	d_bc = ||p_b - p_c||
+	•	d_ca = ||p_c - p_a||
+
+Rest lengths from triangle record:
+	•	L_ab, L_bc, L_ca
+
+Define normalized strain per edge:
+	•	s_ab = (d_ab - L_ab) / max(L_ab, ε)  (ε small > 0)
+
+Triangle strain energy (simple):
+	•	E_tri = k * (s_ab² + s_bc² + s_ca²)
+where k = stiffness.
+
+Global energy is sum over triangles (and optional edges).
+
+“Relaxation” update
+
+When something changes (a vertex dragged, event applied):
+	•	Only recompute forces in a local neighborhood (incident triangles).
+	•	Perform N small steps of gradient descent / verlet-like iteration.
+
+Parameters:
+	•	dt step size (small)
+	•	damping reduces oscillation
+
+Confidence dampening (your rule)
+
+Each belief has confidence_base in [0,1].
+
+We compute effective confidence:
+	•	Let strain_i = aggregate strain from triangles touching vertex i:
+	•	e.g. average of incident triangle strains, clamped to ≥ 0
+
+Then:
+	•	confidence_effective = confidence_base * exp(-α * strain_i)
+
+Where:
+	•	α defaults to something like 1.0 (tunable)
+	•	This creates a smooth dampening that increases as triangles stretch
+
+Interpretation:
+	•	Beliefs can move freely in 3D
+	•	But strained neighborhoods become “less trusted” without deleting anything
+
+⸻
+
+Semantics Studio UI Spec: “Postman for agents” experience
+
+Opening behavior
+	•	Double-click .sem → launches Semantics Studio
+	•	Studio spins up a local runtime (localhost) and opens a browser tab
+
+Core panels
+	1.	Mesh View (3D)
+	•	points = beliefs (vertices)
+	•	faces = triangles
+	•	color/heat = strain (tension)
+	•	drag a belief point to move it
+	•	live recompute local strain + effective confidence
+	2.	Belief Inspector
+	•	proposition text
+	•	base vs effective confidence
+	•	provenance
+	•	incident triangles/edges list
+	•	“Neighborhood” quick query button
+	3.	Tension / Coherence Panel
+	•	top strained triangles
+	•	suggested repairs (agent suggestions or heuristics)
+	•	“settle” / “relax” controls
+	4.	Requests (Postman-like)
+	•	list of saved requests from the file (type:"request")
+	•	run request → sends selection to an agent adapter
+	•	shows response + proposed patch
+	•	apply patch (suggest vs auto)
+	5.	History
+	•	event log (append-only)
+	•	diff view (pre/post)
+	•	rollback to checkpoint snapshot
+
+⸻
+
+Local API Spec: Semantics Runtime v1
+
+The runtime is a local HTTP service (and optional WebSocket) used by Studio and agents.
+
+Base URL:
+	•	http://localhost:7318/v1
+
+All responses are JSON.
+
+Authentication / safety (v0.1)
+	•	Default: loopback-only, no remote bind.
+	•	Optional: per-session token for agent access (Studio displays it like Postman env var).
+
+⸻
+
+File endpoints
+
+POST /v1/files/open
+
+Open a .sem file and create a session.
+
+Request
+
+{"path":"/path/to/workspace.sem"}
+
+Response
+
+{"session_id":"s_123","sem_version":"0.1"}
+
+POST /v1/files/save
+
+Materialize current state back into the .sem file.
+
+Request
+
+{"session_id":"s_123","mode":"snapshot+events"}
+
+Response
+
+{"ok":true,"written_path":"/path/to/workspace.sem"}
+
+POST /v1/files/validate
+
+Validate schema + vertex/face mappings.
+
+Request
+
+{"session_id":"s_123"}
+
+Response
+
+{"ok":true,"warnings":[...],"errors":[]}
+
+
+⸻
+
+Beliefs
+
+GET /v1/beliefs?session_id=...
+
+List beliefs.
+
+Response
+
+{
+  "items":[
+    {
+      "id":"b1",
+      "vertex":1,
+      "position":[0,0,0],
+      "proposition":"Belief A",
+      "confidence_base":0.9,
+      "confidence_effective":0.87
+    }
+  ]
+}
+
+PATCH /v1/beliefs/{id}
+
+Update proposition / base confidence / tags / provenance.
+
+Request
+
+{
+  "session_id":"s_123",
+  "set":{
+    "proposition":"Updated text",
+    "confidence_base":0.75
+  }
+}
+
+Response
+
+{"ok":true}
+
+POST /v1/beliefs/{id}/move
+
+Move a belief (vertex) in 3D.
+
+Request
+
+{"session_id":"s_123","position":[0.2,0.4,0.1],"mode":"drag"}
+
+Response
+
+{
+  "ok":true,
+  "affected":{
+    "beliefs":["b1","b2","b3"],
+    "triangles":["t1"]
+  }
+}
+
+
+⸻
+
+Triangles
+
+GET /v1/triangles?session_id=...
+
+List triangles with strain.
+
+POST /v1/triangles
+
+Create triangle (and face) from belief IDs or vertex indices.
+
+Request
+
+{
+  "session_id":"s_123",
+  "vertices":[1,2,3],
+  "rest_mode":"current", 
+  "physics":{"stiffness":1.0,"damping":0.25}
+}
+
+Response
+
+{"ok":true,"triangle_id":"t_new","face":7}
+
+
+⸻
+
+Coherence / relaxation
+
+POST /v1/relax
+
+Run local relaxation steps.
+
+Request
+
+{
+  "session_id":"s_123",
+  "steps":50,
+  "scope":{"mode":"neighborhood","center_belief_id":"b1","radius":2}
+}
+
+Response
+
+{"ok":true,"energy_before":12.4,"energy_after":4.1}
+
+
+⸻
+
+Query (GraphQL-ish without requiring GraphQL)
+
+POST /v1/query
+
+Request
+
+{
+  "session_id":"s_123",
+  "query":{
+    "mode":"neighborhood",
+    "center_belief_id":"b1",
+    "radius":2,
+    "include":["beliefs","triangles","strain"]
+  }
+}
+
+Response
+
+{
+  "beliefs":[...],
+  "triangles":[...],
+  "summary":{
+    "most_strained":[{"triangle_id":"t1","strain":0.42}]
+  }
+}
+
+
+⸻
+
+Agent requests (Postman-like runner)
+
+POST /v1/requests/run
+
+Runs a saved type:"request" from the file.
+
+Request
+
+{"session_id":"s_123","request_id":"r1","agent_adapter":"local_llm|remote_llm|mock"}
+
+Response
+
+{
+  "ok":true,
+  "result":{
+    "text":"…agent output…",
+    "patch":{
+      "type":"patch_v0",
+      "ops":[
+        {"op":"set_confidence","belief_id":"b2","value":0.6,"reason":"high strain"},
+        {"op":"suggest_move","belief_id":"b3","position":[0.1,0.9,0.0]}
+      ]
+    }
+  }
+}
+
+POST /v1/patch/apply
+
+Apply a patch (suggest or auto).
+
+Request
+
+{"session_id":"s_123","patch":{...},"mode":"suggest"}
+
+Response
+
+{"ok":true,"created_events":["ev_...","ev_..."]}
+
+
+⸻
+
+Patch Format v0 (agent-agnostic)
+
+Agents should not rewrite the file directly; they should emit patches.
+
+{
+  "type":"patch_v0",
+  "ops":[
+    {"op":"set_proposition","belief_id":"b1","value":"...","reason":"..."},
+    {"op":"set_confidence","belief_id":"b1","value":0.72,"reason":"..."},
+    {"op":"move_belief","belief_id":"b1","position":[0.2,0.1,0.0],"reason":"reduce strain"},
+    {"op":"add_triangle","belief_ids":["b1","b2","b3"],"rest_mode":"current","reason":"close coherence loop"}
+  ]
+}
+
+Runtime turns patches into type:"event" records (append-only), keeping Git diffs clean.
+
+⸻
+
+Scaling Notes: how this grows from A → B → D
+
+v0 (Personal / A)
+	•	Single file, single user
+	•	100–10,000 beliefs
+	•	Local-only runtime
+	•	Events appended, snapshots on save
+
+v1 (Shared / B)
+	•	Still “a file,” but:
+	•	enforce stable IDs
+	•	add merge guidance (Git conflict resolver inside Studio)
+	•	optional signatures / provenance
+	•	“Workspace bundles”:
+	•	.sem remains the truth
+	•	optional sidecar index: .sem.idx (rebuildable)
+
+v2 (Approaching D)
+	•	.sem becomes the durable context substrate:
+	•	agents query neighborhoods instead of stuffing prompts
+	•	tension-driven retrieval (most strained / most relevant)
+	•	Still not a brain; it’s a context workspace.
+
+⸻
+
+Non-goals (explicitly)
+	•	Not a general reasoning engine
+	•	Not a full cognitive simulation
+	•	Not a universal truth machine
+	•	Not “the model updates itself without oversight” (unless user enables policies)
+
+⸻
+
+What you can build first (practical v0)
+
+If you want the smallest real implementation that still matches your description:
+	1.	Parser:
+	•	Read OBJ v and f
+	•	Parse #@ {json} records
+	•	Map beliefs ↔ vertices, triangles ↔ faces
+	2.	Coherence:
+	•	Compute triangle strain + effective confidence
+	3.	UI:
+	•	3D scatter + triangle wireframe
+	•	click point → inspect belief
+	•	drag point → recompute local strain
+	4.	“Postman”:
+	•	Load type:"request" records
+	•	Run them via a stub adapter (even before real agents)
+	•	Show patch proposals
+
+That’s enough to be real.
+
+⸻
+
+If you want, next I can also provide:
+	•	A formal JSON Schema for each record type
+	•	A reference parser outline (language-agnostic)
+	•	A complete OpenAPI 3.1 spec for the runtime API
+	•	Or a single markdown “docs site” structure (Getting Started, File Spec, API, UI, Agent Integration, Examples)
+
+But the above is the full spec at the level you can hand to an engineer and start building.
+
+Below is a complete product spec + file format spec + API docs for the thing we just designed: a semantic agent file that is simultaneously:
+	•	OBJ-like 3D mesh (beliefs are vertices; triangles are faces)
+	•	JSONL-like (one JSON object per line, editable)
+	•	Postman-like (saved “requests” inside the file, runnable in a browser UI)
+	•	Agent‑agnostic (any agent/model can read/write it)
+	•	A coherence simulator (not a “cognitive simulation”): triangle stretch → confidence dampening
+
+I’m going to call it Semantics with extension .sem (alias .semantics).
+
+⸻
+
+Semantics Product Spec
+
+1. Summary
+
+Semantics (.sem) is a single-file, human-editable, machine-readable, agent-readable semantic interface that stores a 3D belief mesh and opens into a browser-based UI (Postman-for-agents style) for:
+	•	inspecting beliefs as points in a 3D mesh
+	•	viewing relationships as triangles
+	•	querying the mesh (search, neighbors, hotspots)
+	•	mutating beliefs (move points, add triangles, retract)
+	•	running a coherence relaxation step that computes strain and dampens confidence
+
+It is not a general cognition engine. It’s a persistent semantic workspace.
+
+⸻
+
+2. Core primitives
+
+Belief (primitive)
+
+A belief is the smallest atomic unit. In .sem, each belief maps to:
+	•	a vertex in 3D: (x, y, z)
+	•	a proposition (text)
+	•	a base confidence
+	•	derived metrics computed by the coherence engine (strain, derived confidence)
+
+Triangle (minimal coherence unit)
+
+A triangle represents a 3‑way coherence relation among three beliefs.
+	•	triangles come from mesh faces (f a b c)
+	•	triangle “stretch” represents tension among those beliefs
+	•	triangle stretch contributes to confidence dampening on its vertices
+
+Change
+
+A change can be expressed as:
+	•	direct edits to geometry (v lines) and metadata (#@{...})
+	•	optional append-only events (#@{type:"event", ...}) for auditability
+
+⸻
+
+3. Product goals
+
+Goals
+	•	One file that can be checked into git and diffed.
+	•	Open in text editor and understand/modify it.
+	•	Double-click opens browser UI (via Semantics Studio runtime).
+	•	Agent-agnostic read/write contract.
+	•	OBJ-like 3D layer is real, not metaphor.
+	•	Coherence simulation based on geometric strain; dampen confidence when stretched.
+
+Non-goals
+	•	Not a full reasoning system.
+	•	Not training data format.
+	•	Not a “mind” or cognitive simulator.
+	•	Not a universal truth oracle.
+
+⸻
+
+4. Key UX: “Postman for agents”
+
+Semantics Studio UI (browser) must include:
+	•	3D Mesh View: beliefs as points; triangles as faces; tension heatmap
+	•	Inspector: click a belief → show proposition, base confidence, derived confidence, provenance
+	•	Requests Tab: saved requests embedded in file (Postman-like)
+	•	Query Tab: run ad hoc queries (GraphQL-like or JSON query)
+	•	Diff/History Tab: show event log and git-friendly diffs
+	•	Agent Activity: show which agent last modified what, and why (provenance)
+
+⸻
+
+Semantics File Format Spec
+
+1. File type
+	•	Extension: .sem (alias: .semantics)
+	•	MIME (suggested): application/x-semantics+obj
+	•	Encoding: UTF‑8
+	•	Line-oriented
+	•	Valid OBJ superset: any normal .obj parser can ignore semantic lines.
+
+Design trick
+
+All semantic records are stored as OBJ comments that begin with #@:
+	•	OBJ ignores them (# ... is a comment)
+	•	Humans can edit them
+	•	Each one is a single JSON object (JSONL-style)
+
+So the file is simultaneously:
+	•	OBJ geometry (v, f, …)
+	•	JSONL overlay (#@{...} one object per line)
+
+⸻
+
+2. Grammar overview
+
+Geometry layer (OBJ subset)
+
+Required:
+	•	v x y z — vertex positions (belief points)
+	•	f i j k — triangle faces (coherence triangles), 1-based indices
+
+Optional (supported but not required):
+	•	o name, g name — grouping
+	•	usemtl, etc. (ignored by semantics unless referenced)
+
+Overlay layer (Semantics JSONL)
+
+Lines of the form:
+
+#@{ ...valid JSON object... }
+
+
+⸻
+
+3. Canonical indexing rules
+	•	Vertex indices are OBJ vertex indices (1-based).
+	•	Face indices are the order of f lines (1-based), unless you store explicit vertex triplets.
+
+A belief record references either:
+	•	v: vertex index (recommended)
+	•	id: stable identifier (required)
+
+A triangle record references either:
+	•	f: face index (recommended)
+	•	verts: explicit [i, j, k]
+
+⸻
+
+4. Required overlay record types
+
+4.1 Schema record (required once)
+
+Defines versioning and defaults.
+
+#@{"type":"schema","version":"0.1","id":"mesh:demo","confidence_model":"strain_dampen_v1"}
+
+Fields
+	•	type: "schema"
+	•	version: semantic format version
+	•	id: mesh identifier
+	•	confidence_model: "strain_dampen_v1" (v0 default)
+
+Optional:
+	•	units, coordinate_system, created_at, authors, tags
+
+⸻
+
+4.2 Belief record (required per belief)
+
+Maps a belief to a vertex.
+
+#@{"type":"belief","id":"b:sky-blue","v":1,"p":"The sky is blue.","c":0.92,"tags":["perception"]}
+
+Fields
+	•	type: "belief"
+	•	id: stable belief id (string)
+	•	v: vertex index (int, 1-based)
+	•	p: proposition text (string)
+	•	c: base confidence (0..1)
+
+Optional:
+	•	status: "active" | "retracted"
+	•	source: provenance object (see below)
+	•	updated_at: ISO8601
+	•	locked: boolean (prevents relaxation from moving it unless explicitly moved)
+	•	mass: float (default 1.0)
+	•	embedding: { "dim": 1536, "ref": "embeddings.bin#offset=..." } (optional)
+
+⸻
+
+4.3 Triangle record (required per coherence triangle)
+
+Binds semantics to a face and defines “rest” shape for strain.
+
+#@{"type":"triangle","id":"t:sky","f":1,"rest":{"mode":"from_current"},"k":1.0}
+
+Fields
+	•	type: "triangle"
+	•	id: stable triangle id
+	•	f: face index (1-based) OR verts: [i,j,k]
+	•	rest: rest-shape definition
+	•	{ "mode":"from_current" } means: rest lengths are captured from current vertex positions at load-time (or on first creation)
+	•	or { "edge_lengths":[L12,L23,L31] } for explicit rest lengths
+	•	k: stiffness (spring constant) default 1.0
+
+Optional:
+	•	tags
+	•	notes
+	•	created_at
+
+⸻
+
+5. Optional overlay record types
+
+5.1 Evidence
+
+Attach external evidence to beliefs (provenance, citations, excerpts).
+
+#@{"type":"evidence","id":"e:1","belief":"b:sky-blue","weight":0.7,"source":{"kind":"url","ref":"..."},"excerpt":"..."}
+
+5.2 Request (Postman-like)
+
+Saved, runnable operations.
+
+#@{"type":"request","id":"r:hotspots","name":"Tension hotspots","method":"POST","path":"/v1/query","body":{"op":"hotspots","top":10}}
+
+5.3 Environment variables
+
+Postman-style env
+
+#@{"type":"env","vars":{"TOP":10,"HOPS":2}}
+
+5.4 Event log (append-only)
+
+Optional audit trail, merge-friendly.
+
+#@{"type":"event","ts":"2026-02-20T17:10:00Z","actor":"agent:alpha","op":"move","belief":"b:sky-blue","to":[0.2,0.1,0.0],"reason":"new evidence"}
+
+v0 rule: if events exist, Semantics Studio may either (a) apply them on top of current v snapshot, or (b) treat the file as event-sourced depending on schema.mode.
+
+⸻
+
+6. Minimal valid .sem example
+
+# Semantics (.sem) = OBJ + #@ JSONL overlay
+#@{"type":"schema","version":"0.1","id":"mesh:demo","confidence_model":"strain_dampen_v1"}
+
+v 0.0 0.0 0.0
+v 1.0 0.0 0.0
+v 0.0 1.0 0.0
+
+f 1 2 3
+
+#@{"type":"belief","id":"b:1","v":1,"p":"Belief A","c":0.90}
+#@{"type":"belief","id":"b:2","v":2,"p":"Belief B","c":0.80}
+#@{"type":"belief","id":"b:3","v":3,"p":"Belief C","c":0.70}
+
+#@{"type":"triangle","id":"t:abc","f":1,"rest":{"mode":"from_current"},"k":1.0}
+
+#@{"type":"request","id":"r:hotspots","name":"Hotspots","method":"POST","path":"/v1/query","body":{"op":"hotspots","top":10}}
+
+
+⸻
+
+Coherence Engine Spec
+
+1. What it is (and isn’t)
+
+It’s a local relaxation + strain computation system:
+	•	Beliefs can be moved anywhere in 3D.
+	•	Triangles “want” to keep their rest shape (edge lengths).
+	•	Stretch → strain → confidence dampening.
+	•	This yields a coherent interface and diagnostic for tension.
+
+It is not:
+	•	proof-based logic
+	•	global reasoning
+	•	“truth” computation
+
+⸻
+
+2. Data extracted from file
+
+From OBJ:
+	•	vertices: x_i ∈ ℝ³
+	•	faces (triangles): (i,j,k)
+
+From overlay:
+	•	belief ↔ vertex mapping
+	•	triangle stiffness k
+	•	rest lengths L0 per triangle edge
+
+⸻
+
+3. Strain model
+
+For each triangle with vertices (i, j, k) and rest edge lengths:
+	•	L0_ij, L0_jk, L0_ki
+
+Compute current edge lengths:
+	•	L_ij = ||x_i - x_j||, etc.
+
+Edge strain:
+	•	s_ij = |L_ij - L0_ij| / (L0_ij + ε)
+
+Triangle strain (default):
+	•	S_tri = (s_ij² + s_jk² + s_ki²) / 3
+
+Vertex local strain (for belief at vertex i):
+	•	average triangle strain over incident triangles
+	•	or average edge strain over incident edges
+
+⸻
+
+4. Confidence dampening
+
+Beliefs store base confidence c ∈ [0,1].
+
+Engine computes derived confidence c' (not necessarily stored in file; computed live):
+
+Default dampening:
+	•	c' = c · exp(-α · S_local)
+
+Where:
+	•	α is a global sensitivity (default e.g. 2.0)
+	•	S_local is the belief’s local strain
+
+Alternative (more linear):
+	•	c' = c / (1 + β · S_local)
+
+⸻
+
+5. Relaxation / “physics” step
+
+We do not need rigid body physics. We need spring relaxation.
+
+For each triangle edge (a,b):
+	•	define spring with rest length L0_ab
+	•	stiffness derived from triangle k
+
+Force direction:
+	•	along (x_a - x_b)
+
+Integrate with simple damped steps (semi-implicit Euler is fine for v0).
+
+Constraints:
+	•	3D positions always stay 3D
+	•	locked nodes don’t move during relaxation
+	•	optional mass per node affects movement
+
+Outputs:
+	•	updated positions (if you choose to write back)
+	•	computed strain + derived confidences
+	•	hotspots and contradictions candidates (high strain clusters)
+
+⸻
+
+Semantics Studio Runtime
+
+1. What happens when you “click the file”
+
+Semantics Studio (desktop app or CLI launcher) does:
+	1.	Parse .sem file (OBJ + overlay)
+	2.	Build in-memory graph (vertices ↔ beliefs ↔ triangles)
+	3.	Start local server (localhost)
+	4.	Open browser UI bound to that file
+	5.	Any edits can be:
+	•	live in UI (and saved to file)
+	•	live in text editor (Studio auto-reloads)
+
+⸻
+
+2. “File acts like an API”
+
+Two meanings:
+	1.	The runtime exposes an HTTP API to interact with the file’s state.
+	2.	The file itself can contain saved request definitions (#@{"type":"request",...}) which the UI can run.
+
+So .sem becomes:
+	•	state container
+	•	query surface
+	•	request collection
+
+⸻
+
+HTTP API Docs (Semantics Runtime)
+
+Base URL (local): http://localhost:PORT
+
+Versioned path: /v1
+
+Authentication
+
+v0 default: local-only (loopback).
+Optional token:
+	•	Authorization: Bearer <token>
+
+⸻
+
+1. Open / metadata
+
+GET /v1/info
+
+Returns file + schema info.
+
+Response
+
+{
+  "file": "path/to/demo.sem",
+  "schema": {"version":"0.1","id":"mesh:demo"},
+  "counts": {"vertices": 123, "faces": 300, "beliefs": 120, "triangles": 280}
+}
+
+
+⸻
+
+2. Beliefs
+
+GET /v1/beliefs
+
+Query beliefs.
+
+Query params (optional):
+	•	q= text search
+	•	tag=
+	•	status=active|retracted
+	•	top= limit
+
+Response
+
+{
+  "items": [
+    {"id":"b:1","p":"Belief A","v":1,"pos":[0,0,0],"c":0.9,"c_derived":0.83,"strain":0.12}
+  ]
+}
+
+GET /v1/beliefs/{id}
+
+POST /v1/beliefs
+
+Create a belief (+ new vertex) or bind to existing vertex.
+
+Request
+
+{
+  "id": "b:new",
+  "p": "A new belief",
+  "c": 0.7,
+  "pos": [0.2, -0.1, 0.0],
+  "tags": ["draft"]
+}
+
+PATCH /v1/beliefs/{id}
+
+Update proposition/confidence/tags/status/lock.
+
+Request
+
+{"c": 0.85, "status":"active"}
+
+POST /v1/beliefs/{id}/move
+
+Move a belief’s vertex (creates tension until relaxed).
+
+Request
+
+{"to":[1.2,0.4,-0.1], "mode":"set"} 
+
+
+⸻
+
+3. Triangles / coherence links
+
+POST /v1/triangles
+
+Create a triangle connecting 3 beliefs.
+
+Request
+
+{
+  "id":"t:new",
+  "beliefs":["b:1","b:2","b:3"],
+  "rest":{"mode":"from_current"},
+  "k": 1.0
+}
+
+GET /v1/triangles
+
+List triangles + strain.
+
+⸻
+
+4. Coherence / relaxation
+
+POST /v1/relax
+
+Run N relaxation steps and return updated metrics.
+
+Request
+
+{"steps": 50, "dt": 0.02, "writeback": false}
+
+Response
+
+{
+  "updated": {
+    "beliefs": [
+      {"id":"b:1","pos":[0.01,0.0,0.0],"strain":0.08,"c_derived":0.86}
+    ],
+    "hotspots": [
+      {"triangle":"t:abc","strain":0.42}
+    ]
+  }
+}
+
+
+⸻
+
+5. Queries (Postman-like)
+
+POST /v1/query
+
+A single endpoint for “Postman operations”.
+
+Request
+
+{"op":"hotspots","top":10}
+
+Supported op (v0 set):
+	•	search { q, top }
+	•	neighbors { belief, hops, top }
+	•	nearest { pos:[x,y,z], radius, top }
+	•	hotspots { top } (highest strain triangles/regions)
+	•	contradictions { top } (heuristics: high tension + opposing tags/provenance conflict)
+	•	submesh { belief, hops } (return induced local mesh)
+
+⸻
+
+6. Saved requests in file
+
+GET /v1/requests
+
+List request objects embedded in the .sem file.
+
+POST /v1/requests/{id}/run
+
+Runs a saved request, with optional env overrides.
+
+⸻
+
+7. Persistence
+
+POST /v1/save
+
+Writes current state back to file (and optional compaction).
+
+Request
+
+{"format":"preserve_obj", "compact_events": true}
+
+GET /v1/export/obj
+
+Exports pure OBJ (drops #@ lines).
+
+⸻
+
+8. Live updates
+
+GET /v1/events/stream (SSE)
+
+Streams changes as they occur (UI + agents subscribe).
+
+Event example:
+
+{"type":"belief_moved","id":"b:1","pos":[...],"by":"agent:alpha"}
+
+
+⸻
+
+Optional GraphQL API
+
+If you want the GraphQL feel you mentioned:
+	•	Endpoint: POST /v1/graphql
+
+Example schema sketch
+	•	Belief { id, proposition, baseConfidence, derivedConfidence, position, tags }
+	•	Triangle { id, beliefs, strain }
+	•	Query { belief(id), search(q), hotspots(top), neighbors(id,hops) }
+	•	Mutation { moveBelief(id,to), addBelief(...), addTriangle(...), relax(steps) }
+
+⸻
+
+OpenAPI 3.1 (Starter)
+
+Here’s a compact OpenAPI starter you can expand:
+
+openapi: 3.1.0
+info:
+  title: Semantics Runtime API
+  version: "0.1"
+servers:
+  - url: http://localhost:{port}
+    variables:
+      port: { default: "7711" }
+
+paths:
+  /v1/info:
+    get:
+      operationId: getInfo
+      responses:
+        "200":
+          description: Runtime + file info
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /v1/beliefs:
+    get:
+      operationId: listBeliefs
+      parameters:
+        - in: query
+          name: q
+          schema: { type: string }
+        - in: query
+          name: tag
+          schema: { type: string }
+        - in: query
+          name: top
+          schema: { type: integer, default: 50 }
+      responses:
+        "200":
+          description: Beliefs
+          content:
+            application/json:
+              schema:
+                type: object
+    post:
+      operationId: createBelief
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, p, c, pos]
+              properties:
+                id: { type: string }
+                p: { type: string }
+                c: { type: number, minimum: 0, maximum: 1 }
+                pos:
+                  type: array
+                  items: { type: number }
+                  minItems: 3
+                  maxItems: 3
+                tags:
+                  type: array
+                  items: { type: string }
+      responses:
+        "200": { description: Created }
+
+  /v1/beliefs/{id}:
+    get:
+      operationId: getBelief
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Belief }
+    patch:
+      operationId: patchBelief
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200": { description: Updated }
+
+  /v1/beliefs/{id}/move:
+    post:
+      operationId: moveBelief
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to]
+              properties:
+                to:
+                  type: array
+                  items: { type: number }
+                  minItems: 3
+                  maxItems: 3
+                mode:
+                  type: string
+                  enum: [set, delta]
+                  default: set
+      responses:
+        "200": { description: Moved }
+
+  /v1/triangles:
+    post:
+      operationId: createTriangle
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, beliefs]
+              properties:
+                id: { type: string }
+                beliefs:
+                  type: array
+                  items: { type: string }
+                  minItems: 3
+                  maxItems: 3
+                rest:
+                  type: object
+                k:
+                  type: number
+                  default: 1.0
+      responses:
+        "200": { description: Created }
+
+  /v1/relax:
+    post:
+      operationId: relax
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                steps: { type: integer, default: 50 }
+                dt: { type: number, default: 0.02 }
+                writeback: { type: boolean, default: false }
+      responses:
+        "200": { description: Updated metrics }
+
+  /v1/query:
+    post:
+      operationId: query
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [op]
+              properties:
+                op:
+                  type: string
+                  enum: [search, neighbors, nearest, hotspots, contradictions, submesh]
+      responses:
+        "200": { description: Query result }
+
+  /v1/save:
+    post:
+      operationId: save
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                format: { type: string, enum: [preserve_obj] }
+                compact_events: { type: boolean, default: false }
+      responses:
+        "200": { description: Saved }
+
+
+⸻
+
+Git + Scaling Notes
+
+Why git fits naturally
+	•	.sem is line-based.
+	•	Semantic overlay is JSONL-like.
+	•	You can diff changes in:
+	•	propositions
+	•	confidence values
+	•	triangle definitions
+	•	event lines
+	•	You can treat modifications as “local forces”: moving one vertex causes local strain changes (visible + computable).
+
+Scaling (practical v0 stance)
+
+You don’t need infinite scale. You need:
+	•	sparse triangles
+	•	local neighborhoods
+	•	incremental recomputation
+
+If you do need more:
+	•	build an index sidecar .sem.idx (vertex offsets, belief id → line offset)
+	•	optionally store embeddings in a binary sidecar .sem.emb to avoid JSON bloat
+
+⸻
+
+What you asked for, delivered “exactly”
+	•	✅ Still a file you can open in a text editor
+	•	✅ OBJ 3D layer (v and f)
+	•	✅ Belief primitive lives as a point (vertex) in triangles (faces)
+	•	✅ Stretching triangles dampens confidence (strain → derived confidence)
+	•	✅ Coherence simulator, not cognitive simulation
+	•	✅ Browser UI like Postman for agents
+	•	✅ Agent-agnostic read/write via API + direct file edits
+	•	✅ Saved requests embedded in the file
+
+⸻
+
+If you want, I can also write:
+	•	a JSON Schema for each #@ record type (schema/belief/triangle/event/request)
+	•	a reference implementation spec for the relaxation step (exact pseudocode + defaults)
+	•	a minimal query language (GraphQL-lite) that maps cleanly to /v1/query and can also be embedded as #@{"type":"query",...}
+
+But the above is already enough for someone to build v0 without guessing.
