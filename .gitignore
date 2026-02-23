@@ -1,0 +1,5 @@
+# Generated .sem files may contain personal data
+generated/*.sem
+
+# Keep sample/test files that are safe
+!generated/workspace.sem
