@@ -193,10 +193,11 @@ def convert_memory_v2_to_sem(input_path: str, output_path: str, method: str = 'p
                 src_idx = vertex_index[src]
                 tgt_idx = vertex_index[tgt]
                 
-                # Calculate rest length from positions
-                src_pos = position_lookup.get(src, np.array([0,0,0]))
-                tgt_pos = position_lookup.get(tgt, np.array([0,0,0]))
-                rest_length = float(np.linalg.norm(src_pos - tgt_pos))
+                # Fixed baseline rest length = 1.0
+                # This creates meaningful strain: 
+                # - close beliefs (current < 1.0) = compressed = coherent
+                # - distant beliefs (current > 1.0) = stretched = tension
+                rest_length = 1.0
                 
                 edge = {
                     "type": "edge",
