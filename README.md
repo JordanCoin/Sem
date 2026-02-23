@@ -6,11 +6,26 @@ Layered `.sem` protocol implementation with:
 2. **Coherence layer**: triangle strain and confidence dampening.
 3. **API layer**: local HTTP runtime (`/v1/...`) for agents and UI.
 
+## Quick Start (Python tools)
+
+```bash
+# Convert memory-v2 index to .sem
+python3 converters/memory_v2_to_sem.py memory-index.jsonl workspace.sem
+
+# Query for high-strain beliefs (tensions)
+python3 tools/sem_query.py workspace.sem strain --top 10
+
+# Wake-up context (for agents recovering from session breaks)
+python3 tools/sem_query.py workspace.sem wake --topic "last topic"
+```
+
 ## Files
 
 - `generated/workspace.sem`: canonical sample workspace file.
 - `sem_protocol.c`: low-level generator/validator for the file protocol.
 - `sem_runtime.c`: low-level loopback HTTP runtime implementing the API contract.
+- `converters/`: Import tools (memory-v2 → .sem)
+- `tools/`: Query and analysis tools (strain, neighborhood, wake-up)
 
 ## Build
 
