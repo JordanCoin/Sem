@@ -7,3 +7,6 @@ generated/.sem-state.json
 
 # Don't include personal HTML versions
 paper/*.html
+
+# Viewer may have local .sem copies
+viewer/*.sem

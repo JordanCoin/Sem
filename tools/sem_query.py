@@ -111,11 +111,25 @@ class SemWorkspace:
     
     def calculate_strain(self):
         """
-        Calculate strain in EMBEDDING SPACE (cosine), not 3D.
-        This is the key fix from reviewer feedback.
+        Calculate strain using multiple signals:
+        1. Semantic strain: cosine distance drift (if embeddings changed)
+        2. Temporal strain: edges between beliefs from different time periods
+        3. Relation strain: certain relation types imply inherent tension
+        
+        This is the key fix from reviewer feedback - strain in embedding space,
+        plus additional meaningful signals when embeddings are static.
         """
         strain_sums = defaultdict(float)
         strain_counts = defaultdict(int)
+        
+        # Parse dates for temporal strain calculation
+        def parse_date(date_str):
+            if not date_str:
+                return None
+            try:
+                return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+            except:
+                return None
         
         for edge in self.edges:
             b1_id = self.vertex_to_belief.get(edge.vertices[0])
@@ -130,34 +144,64 @@ class SemWorkspace:
             if not b1 or not b2:
                 continue
             
-            # CRITICAL: Compute current length in EMBEDDING SPACE (cosine)
-            # NOT in 3D projection space
+            total_strain = 0.0
+            
+            # 1. SEMANTIC STRAIN: Cosine distance in embedding space
             if b1.embedding is not None and b2.embedding is not None:
                 edge.current_length = cosine_distance(b1.embedding, b2.embedding)
+                if edge.rest_length > 0 and edge.current_length > 0:
+                    semantic_strain = abs(math.log(edge.current_length / edge.rest_length))
+                    total_strain += semantic_strain
             else:
-                # Fallback: if no embeddings, use rest length (no strain)
                 edge.current_length = edge.rest_length
             
-            # Accumulate strain magnitude
-            s = edge.strain_magnitude
-            strain_sums[b1_id] += s
+            # 2. TEMPORAL STRAIN: Age gap between connected beliefs
+            # Old belief connected to new belief = potential staleness
+            d1 = parse_date(b1.updated_at)
+            d2 = parse_date(b2.updated_at)
+            if d1 and d2:
+                age_gap_days = abs((d1 - d2).total_seconds()) / 86400
+                # Strain increases with age gap, normalized to 0-1 range
+                # 30+ days apart = high temporal strain
+                temporal_strain = min(1.0, age_gap_days / 30) * 0.3
+                total_strain += temporal_strain
+            
+            # 3. RELATION STRAIN: Some relations imply inherent tension
+            relation_weights = {
+                'contradicts': 0.8,  # Explicit contradiction
+                'supersedes': 0.4,   # Old belief superseded
+                'caused_by': 0.1,    # Causal link, some tension
+                'caused': 0.1,
+                'elaborates': 0.05,  # Low tension
+                'related': 0.1       # Generic
+            }
+            relation_strain = relation_weights.get(edge.relation, 0.1)
+            total_strain += relation_strain
+            
+            # Accumulate
+            strain_sums[b1_id] += total_strain
             strain_counts[b1_id] += 1
-            strain_sums[b2_id] += s
+            strain_sums[b2_id] += total_strain
             strain_counts[b2_id] += 1
         
+        # Also add strain for ISOLATED beliefs (no edges = disconnected = needs attention)
+        for belief_id, belief in self.beliefs.items():
+            if strain_counts[belief_id] == 0:
+                # Isolated beliefs get moderate strain
+                strain_sums[belief_id] = 0.15
+                strain_counts[belief_id] = 1
+        
         # Compute per-belief strain and status
-        # Note: We do NOT modify confidence_effective anymore
-        # Strain means "needs review", not "less true"
         for belief_id, belief in self.beliefs.items():
             if strain_counts[belief_id] > 0:
                 belief.strain = strain_sums[belief_id] / strain_counts[belief_id]
             else:
                 belief.strain = 0.0
             
-            # Status thresholds (calibrated for log-ratio strain)
+            # Status thresholds (calibrated for combined strain)
             if belief.strain > 0.5:
                 belief.strain_status = "high_tension"
-            elif belief.strain > 0.2:
+            elif belief.strain > 0.25:
                 belief.strain_status = "needs_review"
             else:
                 belief.strain_status = "stable"
