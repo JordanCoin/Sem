@@ -1,5 +1,9 @@
 # Generated .sem files may contain personal data
 generated/*.sem
+generated/.sem-state.json
 
 # Keep sample/test files that are safe
 !generated/workspace.sem
+
+# Don't include personal HTML versions
+paper/*.html

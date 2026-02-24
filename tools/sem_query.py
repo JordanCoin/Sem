@@ -2,8 +2,10 @@
 """
 sem_query.py - Query a .sem file for strain, neighborhoods, and wake-up context
 
-This is the "blink recovery" tool - helps an agent understand what needs attention
-after waking up from a session break.
+v2.0 - Fixed metric consistency:
+- Strain computed in embedding space (cosine), not 3D projection
+- 3D positions are for visualization only
+- Confidence is NOT auto-penalized by strain (strain = "needs review", not "less true")
 
 Usage:
     python3 sem_query.py <file.sem> strain [--top N]
@@ -16,34 +18,66 @@ Part of: https://github.com/JordanCoin/Sem
 
 import json
 import sys
-import re
+import base64
+import struct
 import math
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
 from collections import defaultdict
+import numpy as np
+
+# ============================================================================
+# Embedding utilities
+# ============================================================================
+
+def decode_base64_embedding(data: str, dims: int = 384) -> Optional[np.ndarray]:
+    """Decode base64-encoded float32 embedding."""
+    if not data:
+        return None
+    try:
+        raw = base64.b64decode(data)
+        floats = struct.unpack(f'{dims}f', raw)
+        return np.array(floats, dtype=np.float32)
+    except Exception:
+        return None
+
+def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
+    """Compute cosine distance (1 - cosine_similarity) between two vectors."""
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a == 0 or norm_b == 0:
+        return 1.0
+    similarity = np.dot(a, b) / (norm_a * norm_b)
+    similarity = max(-1.0, min(1.0, similarity))
+    return 1.0 - similarity
+
+# ============================================================================
+# Data structures
+# ============================================================================
 
 @dataclass
 class Belief:
     id: str
     vertex: int
-    position: Tuple[float, float, float]
+    position: Tuple[float, float, float]  # 3D for visualization only
     proposition: str
     confidence_base: float
     tags: List[str]
     provenance: Dict[str, Any]
     updated_at: str
+    embedding: Optional[np.ndarray] = None  # Full embedding for strain computation
     
     # Computed
     strain: float = 0.0
-    confidence_effective: float = 0.0
+    strain_status: str = "stable"  # "stable", "needs_review", "high_tension"
 
 @dataclass
 class Edge:
     id: str
     vertices: Tuple[int, int]
-    rest_length: float
-    current_length: float = 0.0
+    rest_length: float  # Cosine distance at creation
+    current_length: float = 0.0  # Cosine distance now (computed from embeddings)
     stiffness: float = 1.0
     damping: float = 0.2
     relation: str = "related"
@@ -52,10 +86,20 @@ class Edge:
     
     @property
     def strain(self) -> float:
-        """Normalized strain: (current - rest) / rest"""
-        if self.rest_length <= 0:
+        """
+        Normalized strain using log ratio (symmetric, bounded).
+        log(current/rest) instead of (current-rest)/rest
+        This prevents blow-up when rest_length is small.
+        """
+        if self.rest_length <= 0 or self.current_length <= 0:
             return 0.0
-        return (self.current_length - self.rest_length) / self.rest_length
+        # Log ratio is symmetric and bounded
+        return math.log(self.current_length / self.rest_length)
+    
+    @property
+    def strain_magnitude(self) -> float:
+        """Absolute strain for ranking."""
+        return abs(self.strain)
 
 @dataclass 
 class SemWorkspace:
@@ -63,15 +107,17 @@ class SemWorkspace:
     edges: List[Edge] = field(default_factory=list)
     vertex_to_belief: Dict[int, str] = field(default_factory=dict)
     belief_edges: Dict[str, List[Edge]] = field(default_factory=lambda: defaultdict(list))
+    header: Dict[str, Any] = field(default_factory=dict)
     
     def calculate_strain(self):
-        """Calculate current edge lengths and belief strain from accumulated edges."""
-        # For each belief, accumulate strain from incident edges
+        """
+        Calculate strain in EMBEDDING SPACE (cosine), not 3D.
+        This is the key fix from reviewer feedback.
+        """
         strain_sums = defaultdict(float)
         strain_counts = defaultdict(int)
         
         for edge in self.edges:
-            # Get positions
             b1_id = self.vertex_to_belief.get(edge.vertices[0])
             b2_id = self.vertex_to_belief.get(edge.vertices[1])
             
@@ -84,29 +130,37 @@ class SemWorkspace:
             if not b1 or not b2:
                 continue
             
-            # Calculate current length
-            dx = b1.position[0] - b2.position[0]
-            dy = b1.position[1] - b2.position[1]
-            dz = b1.position[2] - b2.position[2]
-            edge.current_length = math.sqrt(dx*dx + dy*dy + dz*dz)
+            # CRITICAL: Compute current length in EMBEDDING SPACE (cosine)
+            # NOT in 3D projection space
+            if b1.embedding is not None and b2.embedding is not None:
+                edge.current_length = cosine_distance(b1.embedding, b2.embedding)
+            else:
+                # Fallback: if no embeddings, use rest length (no strain)
+                edge.current_length = edge.rest_length
             
-            # Accumulate strain for both endpoints
-            s = abs(edge.strain)
+            # Accumulate strain magnitude
+            s = edge.strain_magnitude
             strain_sums[b1_id] += s
             strain_counts[b1_id] += 1
             strain_sums[b2_id] += s
             strain_counts[b2_id] += 1
         
-        # Average strain per belief and compute effective confidence
-        alpha = 1.0  # dampening factor
+        # Compute per-belief strain and status
+        # Note: We do NOT modify confidence_effective anymore
+        # Strain means "needs review", not "less true"
         for belief_id, belief in self.beliefs.items():
             if strain_counts[belief_id] > 0:
                 belief.strain = strain_sums[belief_id] / strain_counts[belief_id]
             else:
                 belief.strain = 0.0
             
-            # confidence_effective = confidence_base * exp(-alpha * strain)
-            belief.confidence_effective = belief.confidence_base * math.exp(-alpha * belief.strain)
+            # Status thresholds (calibrated for log-ratio strain)
+            if belief.strain > 0.5:
+                belief.strain_status = "high_tension"
+            elif belief.strain > 0.2:
+                belief.strain_status = "needs_review"
+            else:
+                belief.strain_status = "stable"
 
 def parse_sem_file(path: str) -> SemWorkspace:
     """Parse a .sem file into a queryable workspace."""
@@ -134,10 +188,17 @@ def parse_sem_file(path: str) -> SemWorkspace:
                 
                 record_type = record.get('type')
                 
-                if record_type == 'belief':
+                if record_type == 'header':
+                    workspace.header = record
+                
+                elif record_type == 'belief':
                     vertex_idx = record.get('vertex', 0)
-                    # Vertex index in OBJ is 1-based, our list is 0-based
                     pos = vertices[vertex_idx - 1] if vertex_idx > 0 and vertex_idx <= len(vertices) else (0, 0, 0)
+                    
+                    # Decode embedding if present
+                    embedding = None
+                    if record.get('embedding'):
+                        embedding = decode_base64_embedding(record['embedding'])
                     
                     belief = Belief(
                         id=record.get('id', ''),
@@ -147,7 +208,8 @@ def parse_sem_file(path: str) -> SemWorkspace:
                         confidence_base=record.get('confidence_base', 0.5),
                         tags=record.get('tags', []),
                         provenance=record.get('provenance', {}),
-                        updated_at=record.get('updated_at', '')
+                        updated_at=record.get('updated_at', ''),
+                        embedding=embedding
                     )
                     workspace.beliefs[belief.id] = belief
                     workspace.vertex_to_belief[vertex_idx] = belief.id
@@ -161,7 +223,7 @@ def parse_sem_file(path: str) -> SemWorkspace:
                     edge = Edge(
                         id=record.get('id', ''),
                         vertices=(verts[0], verts[1]),
-                        rest_length=rest.get('length', 1.0),
+                        rest_length=rest.get('length', 0.5),
                         stiffness=physics.get('stiffness', 1.0),
                         damping=physics.get('damping', 0.2),
                         relation=semantics.get('relation', 'related'),
@@ -170,16 +232,19 @@ def parse_sem_file(path: str) -> SemWorkspace:
                     )
                     workspace.edges.append(edge)
                     
-                    # Track edges per belief
                     if edge.source_id:
                         workspace.belief_edges[edge.source_id].append(edge)
                     if edge.target_id:
                         workspace.belief_edges[edge.target_id].append(edge)
     
-    # Calculate strain
+    # Calculate strain in embedding space
     workspace.calculate_strain()
     
     return workspace
+
+# ============================================================================
+# Query functions
+# ============================================================================
 
 def query_high_strain(workspace: SemWorkspace, top_n: int = 10) -> List[Dict]:
     """Return beliefs with highest strain (most tension)."""
@@ -195,10 +260,11 @@ def query_high_strain(workspace: SemWorkspace, top_n: int = 10) -> List[Dict]:
             'id': b.id,
             'proposition': b.proposition,
             'strain': round(b.strain, 4),
+            'strain_status': b.strain_status,
             'confidence_base': b.confidence_base,
-            'confidence_effective': round(b.confidence_effective, 4),
             'tags': b.tags,
-            'type': b.provenance.get('type', 'unknown')
+            'type': b.provenance.get('type', 'unknown'),
+            'edge_count': len(workspace.belief_edges.get(b.id, []))
         })
     
     return results
@@ -228,7 +294,7 @@ def query_neighborhood(workspace: SemWorkspace, center_id: str, radius: int = 2)
             'id': b.id,
             'proposition': b.proposition,
             'strain': round(b.strain, 4),
-            'confidence_effective': round(b.confidence_effective, 4),
+            'strain_status': b.strain_status,
             'is_center': belief_id == center_id
         })
     
@@ -245,17 +311,14 @@ def query_recent(workspace: SemWorkspace, since: Optional[str] = None, top_n: in
     
     for b in workspace.beliefs.values():
         try:
-            # Parse ISO date
             dt_str = b.updated_at.replace('Z', '+00:00')
             dt = datetime.fromisoformat(dt_str)
             beliefs_with_dates.append((dt, b))
         except:
             continue
     
-    # Sort by date descending
     beliefs_with_dates.sort(key=lambda x: x[0], reverse=True)
     
-    # Filter by since date if provided
     if since:
         try:
             since_dt = datetime.fromisoformat(since.replace('Z', '+00:00'))
@@ -270,6 +333,7 @@ def query_recent(workspace: SemWorkspace, since: Optional[str] = None, top_n: in
             'proposition': b.proposition,
             'updated_at': b.updated_at,
             'strain': round(b.strain, 4),
+            'strain_status': b.strain_status,
             'type': b.provenance.get('type', 'unknown')
         })
     
@@ -304,6 +368,7 @@ def query_by_topic(workspace: SemWorkspace, topic: str, top_n: int = 10) -> List
             'proposition': b.proposition,
             'match_score': score,
             'strain': round(b.strain, 4),
+            'strain_status': b.strain_status,
             'tags': b.tags
         })
     
@@ -314,17 +379,29 @@ def wake_query(workspace: SemWorkspace, topic: Optional[str] = None, top_n: int 
     The "blink recovery" query - what an agent should see on wake-up.
     
     Returns:
-    - high_strain: beliefs that need reconciling (contradictions/tension)
+    - high_strain: beliefs that need attention (not "wrong", just "unresolved")
     - topic_neighborhood: if topic provided, relevant context
     - recent_changes: what was updated recently
     - stats: overall workspace health
     """
+    # Count beliefs by strain status
+    status_counts = defaultdict(int)
+    for b in workspace.beliefs.values():
+        status_counts[b.strain_status] += 1
+    
+    # Count embeddings
+    embedded_count = sum(1 for b in workspace.beliefs.values() if b.embedding is not None)
+    
     result = {
         'wake_time': datetime.now(timezone.utc).isoformat(),
         'stats': {
             'total_beliefs': len(workspace.beliefs),
             'total_edges': len(workspace.edges),
-            'avg_strain': round(sum(b.strain for b in workspace.beliefs.values()) / max(len(workspace.beliefs), 1), 4)
+            'embedded_beliefs': embedded_count,
+            'stable': status_counts['stable'],
+            'needs_review': status_counts['needs_review'],
+            'high_tension': status_counts['high_tension'],
+            'strain_metric': 'cosine_distance_log_ratio'  # Document the metric
         },
         'high_strain': query_high_strain(workspace, top_n),
         'recent': query_recent(workspace, top_n=top_n)
@@ -334,7 +411,6 @@ def wake_query(workspace: SemWorkspace, topic: Optional[str] = None, top_n: int 
         topic_matches = query_by_topic(workspace, topic, top_n)
         result['topic_context'] = topic_matches
         
-        # If we found a match, also get its neighborhood
         if topic_matches:
             best_match_id = topic_matches[0]['id']
             result['topic_neighborhood'] = query_neighborhood(workspace, best_match_id, radius=2)
@@ -351,30 +427,38 @@ def format_wake_report(wake_data: Dict) -> str:
     
     stats = wake_data['stats']
     lines.append(f"📊 Workspace: {stats['total_beliefs']} beliefs, {stats['total_edges']} edges")
-    lines.append(f"   Average strain: {stats['avg_strain']}")
+    lines.append(f"   Embedded: {stats['embedded_beliefs']} | Metric: {stats['strain_metric']}")
+    lines.append(f"   Status: {stats['stable']} stable, {stats['needs_review']} needs review, {stats['high_tension']} high tension")
     lines.append("")
     
-    lines.append("⚠️  HIGH STRAIN (beliefs in tension):")
+    lines.append("⚠️  HIGH STRAIN (beliefs needing attention):")
     for item in wake_data.get('high_strain', [])[:5]:
-        strain_bar = "█" * int(item['strain'] * 10) if item['strain'] > 0 else "░"
-        lines.append(f"   [{item['type'][:3].upper()}] {item['proposition'][:60]}...")
-        lines.append(f"       strain={item['strain']} conf={item['confidence_effective']} tags={item['tags'][:3]}")
+        status_emoji = "🔴" if item['strain_status'] == 'high_tension' else "🟡" if item['strain_status'] == 'needs_review' else "🟢"
+        lines.append(f"   {status_emoji} [{item['type'][:3].upper()}] {item['proposition'][:60]}...")
+        lines.append(f"       strain={item['strain']:.3f} status={item['strain_status']} edges={item['edge_count']}")
     lines.append("")
     
     if 'topic_context' in wake_data and wake_data['topic_context']:
         lines.append("🎯 TOPIC CONTEXT:")
         for item in wake_data['topic_context'][:3]:
             lines.append(f"   • {item['proposition'][:70]}...")
-    lines.append("")
+        lines.append("")
     
     lines.append("🕐 RECENT UPDATES:")
     for item in wake_data.get('recent', [])[:5]:
-        lines.append(f"   [{item['type'][:3].upper()}] {item['proposition'][:60]}...")
+        status_emoji = "🔴" if item['strain_status'] == 'high_tension' else "🟡" if item['strain_status'] == 'needs_review' else "🟢"
+        lines.append(f"   {status_emoji} [{item['type'][:3].upper()}] {item['proposition'][:60]}...")
     
     lines.append("")
     lines.append("=" * 60)
+    lines.append("Note: Strain = semantic drift in embedding space (cosine distance).")
+    lines.append("High strain means 'needs review', not 'probably wrong'.")
     
     return "\n".join(lines)
+
+# ============================================================================
+# CLI
+# ============================================================================
 
 def main():
     if len(sys.argv) < 3:
@@ -418,7 +502,6 @@ def main():
         
         results = wake_query(workspace, topic, top_n)
         
-        # Print formatted report
         print(format_wake_report(results))
         print("\n--- Raw JSON ---")
         print(json.dumps(results, indent=2))

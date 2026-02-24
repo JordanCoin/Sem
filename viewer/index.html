@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stargazer Memory Mesh</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { 
+      background: #0a0a0f; 
+      overflow: hidden; 
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+    #container { width: 100vw; height: 100vh; }
+    #info {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      color: #8888aa;
+      font-size: 14px;
+      pointer-events: none;
+    }
+    #info h1 { color: #fff; font-size: 24px; margin-bottom: 8px; }
+    #stats { color: #6a6a8a; margin-top: 10px; }
+    #tooltip {
+      position: absolute;
+      background: rgba(20, 20, 35, 0.95);
+      border: 1px solid #333;
+      border-radius: 8px;
+      padding: 12px 16px;
+      color: #fff;
+      font-size: 13px;
+      max-width: 400px;
+      pointer-events: none;
+      display: none;
+      z-index: 100;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+    }
+    #tooltip .type { 
+      font-size: 10px; 
+      text-transform: uppercase; 
+      color: #888; 
+      margin-bottom: 4px;
+    }
+    #tooltip .strain {
+      margin-top: 8px;
+      font-size: 11px;
+    }
+    #tooltip .strain.high { color: #ff6b6b; }
+    #tooltip .strain.med { color: #ffd93d; }
+    #tooltip .strain.low { color: #6bcb77; }
+    #legend {
+      position: absolute;
+      bottom: 20px;
+      left: 20px;
+      color: #666;
+      font-size: 12px;
+    }
+    #legend div { margin: 4px 0; display: flex; align-items: center; gap: 8px; }
+    #legend .dot { width: 10px; height: 10px; border-radius: 50%; }
+    #controls {
+      position: absolute;
+      top: 20px;
+      right: 20px;
+      color: #888;
+      font-size: 12px;
+    }
+    #focus-panel {
+      position: absolute;
+      top: 80px;
+      right: 20px;
+      background: rgba(20, 20, 35, 0.95);
+      border: 1px solid #333;
+      border-radius: 8px;
+      padding: 16px;
+      color: #fff;
+      font-size: 13px;
+      max-width: 350px;
+      display: none;
+      max-height: 60vh;
+      overflow-y: auto;
+    }
+    #focus-panel h3 { margin: 0 0 8px 0; font-size: 14px; color: #aaa; }
+    #focus-panel .belief-text { margin-bottom: 12px; line-height: 1.4; }
+    #focus-panel .relations { margin-top: 12px; }
+    #focus-panel .relation {
+      padding: 8px;
+      margin: 4px 0;
+      background: rgba(255,255,255,0.05);
+      border-radius: 4px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    #focus-panel .relation:hover { background: rgba(255,255,255,0.1); }
+    #focus-panel .relation-type {
+      font-size: 10px;
+      text-transform: uppercase;
+      color: #888;
+      margin-bottom: 2px;
+    }
+    #focus-panel .close-btn {
+      position: absolute;
+      top: 8px;
+      right: 12px;
+      cursor: pointer;
+      color: #666;
+      font-size: 18px;
+    }
+    #focus-panel .close-btn:hover { color: #fff; }
+    #time-slider {
+      position: absolute;
+      bottom: 20px;
+      right: 20px;
+      background: rgba(20, 20, 35, 0.95);
+      border: 1px solid #333;
+      border-radius: 8px;
+      padding: 12px 16px;
+      color: #fff;
+      font-size: 12px;
+    }
+    #time-slider input {
+      width: 200px;
+      margin: 8px 0;
+    }
+    #time-label { color: #888; }
+  </style>
+</head>
+<body>
+  <div id="container"></div>
+  <div id="info">
+    <h1>✨ Stargazer Memory Mesh</h1>
+    <div>Geometric belief space visualization</div>
+    <div id="stats">Loading...</div>
+  </div>
+  <div id="tooltip"></div>
+  <div id="legend">
+    <div><span class="dot" style="background: #ff6b6b;"></span> High strain (tension)</div>
+    <div><span class="dot" style="background: #ffd93d;"></span> Medium strain</div>
+    <div><span class="dot" style="background: #6bcb77;"></span> Low strain (stable)</div>
+    <div><span class="dot" style="background: #4a9eff;"></span> Recent update</div>
+  </div>
+  <div id="controls">
+    Drag to rotate · Scroll to zoom · Click to focus
+  </div>
+  <div id="focus-panel">
+    <span class="close-btn">&times;</span>
+    <h3>FOCUSED BELIEF</h3>
+    <div class="belief-text"></div>
+    <div class="meta"></div>
+    <div class="relations">
+      <h3>CONNECTIONS</h3>
+      <div class="relation-list"></div>
+    </div>
+  </div>
+  <div id="time-slider">
+    <div id="time-label">All time</div>
+    <input type="range" min="0" max="100" value="100" id="time-range">
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // Parse .sem file
+    async function loadSemFile(url) {
+      const text = await (await fetch(url)).text();
+      const lines = text.split('\n');
+      
+      const vertices = [];
+      const beliefs = [];
+      const edges = [];
+      const beliefById = new Map();
+      
+      for (const line of lines) {
+        if (line.startsWith('v ')) {
+          const [, x, y, z] = line.split(/\s+/).map(Number);
+          vertices.push(new THREE.Vector3(x, y, z));
+        } else if (line.startsWith('#@ ')) {
+          try {
+            const data = JSON.parse(line.slice(3));
+            if (data.type === 'belief') {
+              const belief = {
+                vertex: data.vertex - 1,
+                id: data.id,
+                proposition: data.proposition,
+                confidence: data.confidence_base,
+                tags: data.tags || [],
+                memType: data.provenance?.type || 'unknown',
+                updatedAt: data.updated_at,
+                connections: []
+              };
+              beliefs.push(belief);
+              beliefById.set(data.id, belief);
+            } else if (data.type === 'edge') {
+              const edge = {
+                v1: data.vertices[0] - 1,
+                v2: data.vertices[1] - 1,
+                restLength: data.rest?.length || 1,
+                relation: data.semantics?.relation || 'related',
+                sourceId: data.semantics?.source_id || '',
+                targetId: data.semantics?.target_id || ''
+              };
+              edges.push(edge);
+              
+              // Link edges to beliefs for connection display
+              const source = beliefById.get(edge.sourceId);
+              const target = beliefById.get(edge.targetId);
+              if (source && target) {
+                source.connections.push({ belief: target, relation: edge.relation, direction: 'out' });
+                target.connections.push({ belief: source, relation: edge.relation, direction: 'in' });
+              }
+            }
+          } catch {}
+        }
+      }
+      
+      // Calculate strain for each belief
+      const strainMap = new Map();
+      for (const edge of edges) {
+        const p1 = vertices[edge.v1];
+        const p2 = vertices[edge.v2];
+        if (!p1 || !p2) continue;
+        
+        const currentLen = p1.distanceTo(p2);
+        const strain = Math.abs((currentLen - edge.restLength) / edge.restLength);
+        
+        strainMap.set(edge.v1, (strainMap.get(edge.v1) || 0) + strain);
+        strainMap.set(edge.v2, (strainMap.get(edge.v2) || 0) + strain);
+      }
+      
+      // Normalize and attach strain to beliefs
+      const maxStrain = Math.max(...strainMap.values(), 1);
+      for (const belief of beliefs) {
+        belief.strain = (strainMap.get(belief.vertex) || 0) / maxStrain;
+        belief.position = vertices[belief.vertex];
+      }
+      
+      // Get date range for time slider
+      let minDate = Infinity, maxDate = 0;
+      for (const belief of beliefs) {
+        if (belief.updatedAt) {
+          const ts = new Date(belief.updatedAt).getTime();
+          if (ts < minDate) minDate = ts;
+          if (ts > maxDate) maxDate = ts;
+        }
+      }
+      
+      return { vertices, beliefs, edges, beliefById, minDate, maxDate };
+    }
+
+    // Color based on strain
+    function strainColor(strain, isRecent) {
+      if (isRecent) return new THREE.Color(0x4a9eff);
+      if (strain > 0.7) return new THREE.Color(0xff6b6b);
+      if (strain > 0.3) return new THREE.Color(0xffd93d);
+      return new THREE.Color(0x6bcb77);
+    }
+
+    // Main
+    async function init() {
+      const container = document.getElementById('container');
+      const tooltip = document.getElementById('tooltip');
+      const stats = document.getElementById('stats');
+      const focusPanel = document.getElementById('focus-panel');
+      const timeSlider = document.getElementById('time-range');
+      const timeLabel = document.getElementById('time-label');
+      
+      let focusedNode = null;
+      let allNodes = [];
+      let allEdgeLines = [];
+      
+      // Scene setup
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x0a0a0f);
+      scene.fog = new THREE.Fog(0x0a0a0f, 50, 200);
+      
+      const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+      camera.position.set(30, 20, 30);
+      
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(window.devicePixelRatio);
+      container.appendChild(renderer.domElement);
+      
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.05;
+      controls.autoRotate = true;
+      controls.autoRotateSpeed = 0.5;
+      
+      // Load data
+      const data = await loadSemFile('stargazer-memory.sem');
+      stats.textContent = `${data.beliefs.length} beliefs · ${data.edges.length} edges`;
+      
+      // Recent threshold (7 days)
+      const recentThreshold = Date.now() - 7 * 24 * 60 * 60 * 1000;
+      
+      // Create belief nodes
+      const nodeGeometry = new THREE.SphereGeometry(0.3, 16, 16);
+      const nodes = [];
+      const nodeGroup = new THREE.Group();
+      
+      for (const belief of data.beliefs) {
+        if (!belief.position) continue;
+        
+        const isRecent = belief.updatedAt && new Date(belief.updatedAt).getTime() > recentThreshold;
+        const color = strainColor(belief.strain, isRecent);
+        
+        const material = new THREE.MeshBasicMaterial({ 
+          color,
+          transparent: true,
+          opacity: 0.8
+        });
+        
+        const mesh = new THREE.Mesh(nodeGeometry, material);
+        mesh.position.copy(belief.position);
+        mesh.userData = belief;
+        mesh.scale.setScalar(0.5 + belief.strain * 1.5);
+        
+        nodes.push(mesh);
+        nodeGroup.add(mesh);
+      }
+      scene.add(nodeGroup);
+      
+      allNodes = nodes;
+      
+      // Create edges with strain coloring
+      for (const edge of data.edges) {
+        const p1 = data.vertices[edge.v1];
+        const p2 = data.vertices[edge.v2];
+        if (!p1 || !p2) continue;
+        
+        const currentLen = p1.distanceTo(p2);
+        const strain = Math.abs((currentLen - edge.restLength) / edge.restLength);
+        
+        // Color edges by strain: red if stretched, green if relaxed
+        const edgeColor = strain > 0.5 ? 0x663333 : strain > 0.2 ? 0x555533 : 0x333355;
+        const edgeMaterial = new THREE.LineBasicMaterial({ 
+          color: edgeColor,
+          transparent: true,
+          opacity: 0.25
+        });
+        
+        const geometry = new THREE.BufferGeometry().setFromPoints([p1, p2]);
+        const line = new THREE.Line(geometry, edgeMaterial);
+        line.userData = { edge, v1: edge.v1, v2: edge.v2 };
+        allEdgeLines.push(line);
+        scene.add(line);
+      }
+      
+      // Ambient glow
+      const ambient = new THREE.AmbientLight(0xffffff, 0.5);
+      scene.add(ambient);
+      
+      // Raycaster for hover
+      const raycaster = new THREE.Raycaster();
+      const mouse = new THREE.Vector2();
+      
+      function onMouseMove(event) {
+        mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+        mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+        
+        raycaster.setFromCamera(mouse, camera);
+        const intersects = raycaster.intersectObjects(nodes);
+        
+        if (intersects.length > 0) {
+          const belief = intersects[0].object.userData;
+          const strainPct = (belief.strain * 100).toFixed(0);
+          const strainClass = belief.strain > 0.7 ? 'high' : belief.strain > 0.3 ? 'med' : 'low';
+          
+          tooltip.innerHTML = `
+            <div class="type">${belief.memType}</div>
+            <div>${belief.proposition.slice(0, 200)}${belief.proposition.length > 200 ? '...' : ''}</div>
+            <div class="strain ${strainClass}">Strain: ${strainPct}% · Tags: ${belief.tags.slice(0, 3).join(', ')}</div>
+          `;
+          tooltip.style.display = 'block';
+          tooltip.style.left = event.clientX + 15 + 'px';
+          tooltip.style.top = event.clientY + 15 + 'px';
+          
+          controls.autoRotate = false;
+        } else {
+          tooltip.style.display = 'none';
+          controls.autoRotate = true;
+        }
+      }
+      
+      window.addEventListener('mousemove', onMouseMove);
+      window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+      
+      // Click to focus
+      function onMouseClick(event) {
+        raycaster.setFromCamera(mouse, camera);
+        const intersects = raycaster.intersectObjects(nodes);
+        
+        if (intersects.length > 0) {
+          const belief = intersects[0].object.userData;
+          showFocusPanel(belief, intersects[0].object);
+        }
+      }
+      window.addEventListener('click', onMouseClick);
+      
+      // Focus panel
+      function showFocusPanel(belief, mesh) {
+        focusedNode = mesh;
+        
+        // Dim other nodes
+        for (const node of nodes) {
+          node.material.opacity = node === mesh ? 1.0 : 0.2;
+        }
+        
+        // Highlight connected edges
+        const connectedVertices = new Set([belief.vertex]);
+        for (const conn of belief.connections) {
+          connectedVertices.add(conn.belief.vertex);
+        }
+        
+        for (const line of allEdgeLines) {
+          const isConnected = connectedVertices.has(line.userData.v1) && connectedVertices.has(line.userData.v2);
+          line.material.opacity = isConnected ? 0.8 : 0.05;
+          if (isConnected) {
+            line.material.color.setHex(0x4a9eff);
+          }
+        }
+        
+        // Update panel content
+        focusPanel.querySelector('.belief-text').textContent = belief.proposition;
+        focusPanel.querySelector('.meta').innerHTML = `
+          <div style="color: #888; font-size: 11px; margin-top: 8px;">
+            Type: ${belief.memType} · Strain: ${(belief.strain * 100).toFixed(0)}%<br>
+            Tags: ${belief.tags.slice(0, 5).join(', ')}<br>
+            Updated: ${belief.updatedAt ? new Date(belief.updatedAt).toLocaleDateString() : 'unknown'}
+          </div>
+        `;
+        
+        // Show connections with relation types
+        const relationList = focusPanel.querySelector('.relation-list');
+        relationList.innerHTML = '';
+        
+        const relationColors = {
+          'related': '#6bcb77',
+          'caused': '#ffd93d',
+          'caused_by': '#ffd93d', 
+          'contradicts': '#ff6b6b',
+          'elaborates': '#4a9eff',
+          'supersedes': '#bb86fc'
+        };
+        
+        for (const conn of belief.connections.slice(0, 8)) {
+          const relColor = relationColors[conn.relation] || '#888';
+          const arrow = conn.direction === 'out' ? '→' : '←';
+          const div = document.createElement('div');
+          div.className = 'relation';
+          div.innerHTML = `
+            <div class="relation-type" style="color: ${relColor}">${arrow} ${conn.relation}</div>
+            <div>${conn.belief.proposition.slice(0, 80)}${conn.belief.proposition.length > 80 ? '...' : ''}</div>
+          `;
+          div.onclick = () => {
+            const targetMesh = nodes.find(n => n.userData.id === conn.belief.id);
+            if (targetMesh) showFocusPanel(conn.belief, targetMesh);
+          };
+          relationList.appendChild(div);
+        }
+        
+        if (belief.connections.length > 8) {
+          relationList.innerHTML += `<div style="color: #666; padding: 8px;">+${belief.connections.length - 8} more</div>`;
+        }
+        
+        focusPanel.style.display = 'block';
+        controls.autoRotate = false;
+      }
+      
+      // Close focus panel
+      focusPanel.querySelector('.close-btn').onclick = () => {
+        focusPanel.style.display = 'none';
+        focusedNode = null;
+        
+        // Restore all nodes
+        for (const node of nodes) {
+          node.material.opacity = 0.8;
+        }
+        for (const line of allEdgeLines) {
+          line.material.opacity = 0.25;
+          const strain = Math.abs((line.userData.edge.restLength - 1) / 1);
+          line.material.color.setHex(strain > 0.5 ? 0x663333 : strain > 0.2 ? 0x555533 : 0x333355);
+        }
+        controls.autoRotate = true;
+      };
+      
+      // Time slider
+      timeSlider.oninput = () => {
+        const pct = timeSlider.value / 100;
+        const cutoff = data.minDate + (data.maxDate - data.minDate) * pct;
+        
+        if (pct >= 0.99) {
+          timeLabel.textContent = 'All time';
+        } else {
+          timeLabel.textContent = `Since ${new Date(cutoff).toLocaleDateString()}`;
+        }
+        
+        // Filter nodes by date
+        for (const node of nodes) {
+          const ts = node.userData.updatedAt ? new Date(node.userData.updatedAt).getTime() : 0;
+          const visible = ts >= cutoff || pct >= 0.99;
+          node.visible = visible;
+        }
+        
+        // Update edge visibility
+        for (const line of allEdgeLines) {
+          const v1Visible = nodes.find(n => n.userData.vertex === line.userData.v1)?.visible;
+          const v2Visible = nodes.find(n => n.userData.vertex === line.userData.v2)?.visible;
+          line.visible = v1Visible && v2Visible;
+        }
+      };
+      
+      // Animation
+      function animate() {
+        requestAnimationFrame(animate);
+        controls.update();
+        
+        // Pulse high-strain nodes
+        const time = Date.now() * 0.001;
+        for (const node of nodes) {
+          if (node.userData.strain > 0.5) {
+            const pulse = 1 + Math.sin(time * 3 + node.userData.strain * 10) * 0.1;
+            node.scale.setScalar((0.5 + node.userData.strain * 1.5) * pulse);
+          }
+        }
+        
+        renderer.render(scene, camera);
+      }
+      
+      animate();
+    }
+    
+    init();
+  </script>
+</body>
+</html>
